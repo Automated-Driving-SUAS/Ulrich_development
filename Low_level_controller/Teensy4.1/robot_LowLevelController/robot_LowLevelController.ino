@@ -12,10 +12,13 @@
 #include <micro_ros_utilities/string_utilities.h>
 
 //message type headers
+#include <sensor_msgs/msg/imu.h>
 #include <geometry_msgs/msg/twist.h>
+#include <nav_msgs/msg/odometry.h>
 
 //custom headers
-#include "RoboClaw.h"
+//#include "imuBNO005.h"
+//#include "RoboClaw.h"
 #include "robot.h"
 
 //defines
@@ -33,12 +36,14 @@ rcl_timer_t timer;
 rclc_executor_t executor;
 rclc_support_t support;
 rcl_allocator_t allocator;
+rcl_publisher_t odom_publisher, imu_publisher;
 rcl_subscription_t cmdvel_subscriber;
 bool micro_ros_init_successful;
 
 //variables for ros msgs
+sensor_msgs__msg__Imu imuMsg;
 geometry_msgs__msg__Twist cmdvel_msg;
-
+nav_msgs__msg__Odometry odom_msg;
 
 //time variables
 unsigned long long time_offset = 0;
@@ -48,11 +53,19 @@ const unsigned int timer_timeout = 100;
 //Robot object
 Robot robot(0.15, 0.525, 150); // Wheel radius , track width, max rpm
 
+// Imu object
+Adafruit_BNO055 bno = Adafruit_BNO055(55, 0x28, &Wire2); // PIN 25 to IMU SDA PIN , PIN 24 to IMU SCL PIN 
+
 //Motor driver object
-RoboClaw roboclaw = RoboClaw(&Serial2, 10000);
+RoboClaw roboclaw = RoboClaw(&Serial2, 10000); //PIN 8 TX2 to roboclaw S1 Signal pin and PIN 7 RX2 to roboclaw S2 Signal pin
 
+//Encoder objects
+QuadEncoder leftEncoder(1,0,1,0);   // Encoder on channel 1 of 4 available, 
+                                    // Phase A (pin0), PhaseB(pin1), Pullups Req(0)
+QuadEncoder rightEncoder(2,2,3,0);   // Encoder on channel 1 of 4 available, 
+                                    // Phase A (pin2), PhaseB(pin3), Pullups Req(0)
 
-//states for microcontroller and ros agent connection on the PC
+//connection states for microcontroller and micro ros agent on the PC
 enum states {
   WAITING_AGENT,
   AGENT_AVAILABLE,
@@ -60,28 +73,40 @@ enum states {
   AGENT_DISCONNECTED
 } state;
 
-
-
 //callback for the timer assiged to publisher
 void timer_callback(rcl_timer_t * timer, int64_t last_call_time)
 {
   (void) last_call_time;
   if (timer != NULL) {
+    
     struct timespec time_stamp = getTime();
+
+    //Updating the time stamps for the publishing msgs
+    odom_msg.header.stamp.sec = time_stamp.tv_sec;
+    odom_msg.header.stamp.nanosec = time_stamp.tv_nsec;
+    
+    imuMsg.header.stamp.sec = time_stamp.tv_sec;
+    imuMsg.header.stamp.nanosec = time_stamp.tv_nsec;
+
+    //Update the IMU data and odometry data 
+    robot.updateImuBNO055Data(&bno, &imuMsg);
+    robot.updateOdometryData();
+
+    //Publish the Imu and odom msgs
+    rcl_publish(&imu_publisher, &imuMsg, NULL);
+    rcl_publish(&odom_publisher, &odom_msg, NULL);
   }
 }
 
 // subscriber call back function
 void cmdvel_sub_callback(const void *msgin){
   prev_cmd_time = millis();
-  robot.moveRobot(&cmdvel_msg, &prev_cmd_time);
+
+  //Move the robot according to the input cmd_vel msg
+  robot.moveRobot(&cmdvel_msg, prev_cmd_time);
 }
 
-
-// Functions create_entities and destroy_entities can take several seconds.
-// In order to reduce this rebuild the library with
-// - RMW_UXRCE_ENTITY_CREATION_DESTROY_TIMEOUT=0
-// - UCLIENT_MAX_SESSION_CONNECTION_ATTEMPTS=3
+//If the connection is established the entities are destroied
 
 bool create_entities()
 {
@@ -93,6 +118,22 @@ bool create_entities()
   // create node
   RCCHECK(rclc_node_init_default(&node, "ulrich_robot_node", "", &support));
 
+  // create IMU publisher
+  RCCHECK(rclc_publisher_init_default(
+    &imu_publisher,
+    &node,
+    ROSIDL_GET_MSG_TYPE_SUPPORT(sensor_msgs, msg, Imu),
+    "imu/data")
+  );
+
+  // create odom publisher
+  RCCHECK(rclc_publisher_init_default(
+    &odom_publisher,
+    &node,
+    ROSIDL_GET_MSG_TYPE_SUPPORT(nav_msgs, msg, Odometry),
+    "/odom")
+  );
+
   //create twist msg subscriber
   RCCHECK(rclc_subscription_init_default( 
     &cmdvel_subscriber, 
@@ -101,7 +142,7 @@ bool create_entities()
     "cmd_vel")
   );
 
-  // create timer, it controlled the publish rate
+  // create timer, it controlles the publish rate
   RCCHECK(rclc_timer_init_default(
     &timer,
     &support,
@@ -110,8 +151,12 @@ bool create_entities()
 
   // create executor
   executor = rclc_executor_get_zero_initialized_executor();
-  RCCHECK(rclc_executor_init(&executor, &support.context, 2, &allocator));
+  RCCHECK(rclc_executor_init(&executor, &support.context, 2, &allocator)); //2 handles one for timer and one for subscriber
+  
+  //adding timer to the executor
   RCCHECK(rclc_executor_add_timer(&executor, &timer));
+
+  //adding subscriber to the executor
   RCCHECK(rclc_executor_add_subscription(&executor, &cmdvel_subscriber, &cmdvel_msg, &cmdvel_sub_callback, ON_NEW_DATA));
 
   // synchronize time with the agent
@@ -120,15 +165,19 @@ bool create_entities()
   return true;
 }
 
+//If the connection is broke the entities are destroied
 void destroy_entities()
 {
   rmw_context_t * rmw_context = rcl_context_get_rmw_context(&support.context);
   (void) rmw_uros_set_context_entity_destroy_session_timeout(rmw_context, 0);
+
+  rcl_publisher_fini(&imu_publisher, &node);
+  rcl_publisher_fini(&odom_publisher, &node); 
+  rcl_subscription_fini(&cmdvel_subscriber, &node);
+  rcl_timer_fini(&timer);
+  rclc_executor_fini(&executor);
   rcl_node_fini(&node);
   rclc_support_fini(&support);
-  rclc_executor_fini(&executor);
-  rcl_timer_fini(&timer);
-  rcl_subscription_fini(&cmdvel_subscriber, &node);
 }
 
 void syncTime()
@@ -149,7 +198,7 @@ struct timespec getTime()
   unsigned long long now = millis() + time_offset;
   tp.tv_sec = now / 1000;
   tp.tv_nsec = (now % 1000) * 1000000;
-
+  
   return tp;
 }
 
@@ -158,9 +207,15 @@ void setup() {
   pinMode(LED_PIN, OUTPUT);
 
   state = WAITING_AGENT;
-  robot.motorsInit(&roboclaw, 115200);
+
+  robot.EncodersInit(&leftEncoder, &rightEncoder, 20480); //encoder variable address and resolution of the encoders
+  robot.OdometryInit(&odom_msg); //odom msg variable address and the update time to calculate the velocity
+  robot.motorsInit(&roboclaw, 115200);    //roboclaw object address and baudrate 
+  robot.imuBNO055_init(&bno);
 }
 
+
+//create and destroy the entities with respect to the connection state
 void loop() {
   switch (state) {
     case WAITING_AGENT:
@@ -185,6 +240,7 @@ void loop() {
     default:
       break;
   }
+
   if (state == AGENT_CONNECTED) {
     digitalWrite(LED_PIN, 1);
   } else {
